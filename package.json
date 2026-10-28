@@ -1,0 +1,12 @@
+{
+  "name": "discord-forwarder-bot",
+  "version": "1.0.0",
+  "description": "Forward specific file types between channels",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.0"
+  }
+}
