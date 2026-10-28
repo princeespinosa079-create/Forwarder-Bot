@@ -3,20 +3,32 @@ const {
   SlashCommandBuilder, EmbedBuilder
 } = require('discord.js');
 const fs = require('fs');
+const http = require('http'); // ← Added for Render port check
 
 // ============================================
-// ⚙️ RENDER ENVIRONMENT VARIABLES (NO CONFIG.JSON)
+// ⚙️ RENDER ENVIRONMENT VARIABLES
 // ============================================
 const OWNER_ID     = process.env.OWNER_ID     || '1302080645987569694';
 const BOT_TOKEN    = process.env.BOT_TOKEN;
 const CLIENT_ID    = process.env.CLIENT_ID;
-const DATA_FILE    = '/tmp/forwarder_data.json'; // Render writable storage
+const PORT         = process.env.PORT || 10000; // Render auto-sets this
+const DATA_FILE    = '/tmp/forwarder_data.json';
 const ALLOWED_EXT  = ['txt', 'lua', 'zip'];
-const BATCH_SIZE   = 10;  // Discord hard limit = 10 files/message (DO NOT CHANGE)
-const SEND_WORKERS = 2;   // Parallel send workers (2 = fastest SAFE speed)
+const BATCH_SIZE   = 10;
+const SEND_WORKERS = 2;
 
 // ============================================
-// 💾 PERSISTENCE (Survives Render restarts)
+// 🚩 RENDER PORT HEALTH CHECK (FIXES YOUR ERROR)
+// ============================================
+http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('✅ Forwarder Bot Online');
+}).listen(PORT, () => {
+  console.log(`🌐 Render health check running on port ${PORT}`);
+});
+
+// ============================================
+// 💾 PERSISTENCE
 // ============================================
 let userTokens = new Map();
 let whitelist  = new Set();
@@ -42,7 +54,7 @@ function saveData() {
 }
 
 // ============================================
-// 🤖 BOT CLIENT SETUP
+// 🤖 BOT CLIENT
 // ============================================
 const client = new Client({
   intents: [
@@ -51,226 +63,166 @@ const client = new Client({
     GatewayIntentBits.MessageContent
   ],
   partials: [Partials.Message, Partials.Channel],
-  restRequestTimeout: 120000, // 2min timeout for huge channel scans
+  restRequestTimeout: 120000,
   retryLimit: 5
 });
 
 // ============================================
-// ⚡ SLASH COMMANDS DEFINITION
+// ⚡ COMMANDS
 // ============================================
 const commands = [
   new SlashCommandBuilder()
     .setName('login')
     .setDescription('🔐 Login with your private token')
-    .addStringOption(o => o
-      .setName('token')
-      .setDescription('Your private token (ONLY YOU SEE THIS)')
-      .setRequired(true)),
+    .addStringOption(o => o.setName('token').setDescription('Private token').setRequired(true)),
 
   new SlashCommandBuilder()
     .setName('forward')
-    .setDescription('⚡ UNLIMITED Forward .txt/.lua/.zip + auto skip duplicates')
-    .addChannelOption(o => o
-      .setName('source')
-      .setDescription('Source channel (ID or mention)')
-      .setRequired(true))
-    .addChannelOption(o => o
-      .setName('destination')
-      .setDescription('Destination channel (ID or mention)')
-      .setRequired(true)),
+    .setDescription('⚡ UNLIMITED forward + auto skip duplicates')
+    .addChannelOption(o => o.setName('source').setDescription('Source channel').setRequired(true))
+    .addChannelOption(o => o.setName('destination').setDescription('Destination channel').setRequired(true)),
 
   new SlashCommandBuilder()
     .setName('whitelist')
-    .setDescription('👑 OWNER ONLY — Manage who can use the bot')
-    .addStringOption(o => o
-      .setName('mode')
-      .setDescription('Choose action')
-      .setRequired(true)
-      .addChoices(
-        { name: 'Add',    value: 'add'    },
-        { name: 'Remove', value: 'remove' },
-        { name: 'List',   value: 'list'   }
-      ))
-    .addUserOption(o => o
-      .setName('user')
-      .setDescription('User (mention or paste ID)')
-      .setRequired(false))
+    .setDescription('👑 OWNER ONLY')
+    .addStringOption(o => o.setName('mode').setRequired(true)
+      .addChoices({name:'Add',value:'add'},{name:'Remove',value:'remove'},{name:'List',value:'list'}))
+    .addUserOption(o => o.setName('user').setDescription('User (ID/mention)'))
 ].map(c => c.toJSON());
 
 // ============================================
-// 🚀 UNLIMITED MESSAGE FETCHER (NO LIMIT — GOES TO CHANNEL START)
+// 🚀 UNLIMITED FETCHERS
 // ============================================
 async function fetchAllMessages(channel) {
-  const all = [];
-  let lastId = null;
+  const all = []; let lastId = null;
   while (true) {
-    const batch = await channel.messages.fetch({
-      limit: 100,
-      before: lastId || undefined
-    });
-    if (!batch.size) break; // No more messages = stop
-    all.push(...batch.values());
-    lastId = batch.last().id;
+    const batch = await channel.messages.fetch({ limit:100, before: lastId||undefined });
+    if (!batch.size) break;
+    all.push(...batch.values()); lastId = batch.last().id;
   }
-  return all.reverse(); // Oldest → newest order
+  return all.reverse();
 }
 
-// ============================================
-// 🆔 FETCH ALL EXISTING FILE SIGNATURES FROM DESTINATION (FOR DUPLICATE CHECK)
-// Signature = "filename|filesize" (100% accurate duplicate detection)
-// ============================================
-async function fetchDestinationSignatures(channel) {
-  const signatures = new Set(); // O(1) instant lookups
-  let lastId = null;
+async function fetchDestSignatures(channel) {
+  const sigs = new Set(); let lastId = null;
   while (true) {
-    const batch = await channel.messages.fetch({
-      limit: 100,
-      before: lastId || undefined
-    });
+    const batch = await channel.messages.fetch({ limit:100, before: lastId||undefined });
     if (!batch.size) break;
     for (const msg of batch.values()) {
       if (!msg.attachments.size) continue;
-      for (const att of msg.attachments.values()) {
-        // Case-insensitive filename + exact size = perfect duplicate match
-        signatures.add(`${att.name.toLowerCase()}|${att.size}`);
-      }
+      for (const a of msg.attachments.values()) sigs.add(`${a.name.toLowerCase()}|${a.size}`);
     }
     lastId = batch.last().id;
   }
-  return signatures;
+  return sigs;
 }
 
 // ============================================
-// ⚡ PARALLEL BATCH SENDER (MAX SPEED)
+// ⚡ PARALLEL SEND
 // ============================================
-async function sendBatchesFast(channel, batches) {
-  let idx = 0;
-  const total = batches.length;
-
+async function sendFast(channel, batches) {
+  let i = 0; const total = batches.length;
   async function worker() {
-    while (idx < total) {
-      const i = idx++;
-      try {
-        await channel.send({ files: batches[i] });
-      } catch (err) {
-        // Retry ONCE on rate limit / network blip
-        await new Promise(r => setTimeout(r, 1500));
-        try { await channel.send({ files: batches[i] }); }
-        catch (e) { console.log('[FAIL] Batch', i, ':', e.message); }
-      }
+    while (i < total) {
+      const n = i++;
+      try { await channel.send({ files: batches[n] }); }
+      catch { await new Promise(r=>setTimeout(r,1500)); try { await channel.send({ files: batches[n] }); } catch{} }
     }
   }
-
-  // Spawn N workers running IN PARALLEL
-  await Promise.all(
-    Array.from({ length: SEND_WORKERS }, worker)
-  );
+  await Promise.all(Array.from({length:SEND_WORKERS}, worker));
 }
 
 // ============================================
-// 🔑 PERMISSION CHECKS
+// 🔑 PERMS
 // ============================================
-const isOwner       = id => id === OWNER_ID;
+const isOwner = id => id === OWNER_ID;
 const isWhitelisted = id => isOwner(id) || whitelist.has(id);
-const isLoggedIn    = id => userTokens.has(id);
+const isLoggedIn = id => userTokens.has(id);
 
 // ============================================
-// ✅ BOT READY → REGISTER COMMANDS
+// ✅ READY
 // ============================================
 client.once('ready', async () => {
   loadData();
-  console.log(`\n✅ ONLINE as ${client.user.tag}`);
-  console.log(`👑 OWNER ID: ${OWNER_ID}`);
-  console.log(`⚡ UNLIMITED MODE ACTIVE | ${SEND_WORKERS} workers | ${BATCH_SIZE} files/batch\n`);
-
-  const rest = new REST({ version: '10' }).setToken(BOT_TOKEN);
-  try {
-    await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
-    console.log('⚡ Slash commands registered (global — ~1min to appear)');
-  } catch (e) { console.error('❌ Command register FAIL:', e.message); }
+  console.log(`✅ Bot online: ${client.user.tag}`);
+  const rest = new REST({version:'10'}).setToken(BOT_TOKEN);
+  try { await rest.put(Routes.applicationCommands(CLIENT_ID), {body:commands}); console.log('⚡ Commands registered'); }
+  catch(e){console.error('Command fail:',e.message)}
 });
 
 // ============================================
 // 🎮 COMMAND HANDLER
 // ============================================
-client.on('interactionCreate', async (i) => {
+client.on('interactionCreate', async i => {
   if (!i.isChatInputCommand()) return;
   const { commandName, user } = i;
 
-  // ==========================================
-  // 👑 /WHITELIST — OWNER ONLY (UNCHANGED)
-  // ==========================================
+  // 👑 WHITELIST
   if (commandName === 'whitelist') {
-    if (!isOwner(user.id)) return i.reply({
-      content: '🔒 **OWNER ONLY** — You are not allowed to use this.',
-      ephemeral: true
-    });
-
-    const mode   = i.options.getString('mode');
-    const target = i.options.getUser('user');
-
-    if (mode === 'list') {
-      const list = whitelist.size
-        ? [...whitelist].map(id => `• <@${id}> → \`${id}\``).join('\n')
-        : '*(whitelist is empty)*';
-      return i.reply({
-        embeds: [new EmbedBuilder()
-          .setTitle('📋 Whitelisted Users')
-          .setDescription(list)
-          .setColor('Blurple')
-          .setFooter({ text: `Total: ${whitelist.size} user(s)` })],
-        ephemeral: true
-      });
-    }
-
-    if (!target) return i.reply({
-      content: '❌ You must provide a **user** (mention or ID) for Add / Remove.',
-      ephemeral: true
-    });
-
-    if (mode === 'add') {
-      whitelist.add(target.id);
-      saveData();
-      return i.reply({
-        content: `✅ **ADDED** <@${target.id}> (\`${target.id}\`) to whitelist.`,
-        ephemeral: true
-      });
-    }
-
-    if (mode === 'remove') {
-      whitelist.delete(target.id);
-      userTokens.delete(target.id);
-      saveData();
-      return i.reply({
-        content: `❌ **REMOVED** <@${target.id}> + logged them out.`,
-        ephemeral: true
-      });
-    }
+    if (!isOwner(user.id)) return i.reply({content:'🔒 OWNER ONLY', ephemeral:true});
+    const mode = i.options.getString('mode'); const t = i.options.getUser('user');
+    if (mode === 'list') return i.reply({embeds:[new EmbedBuilder().setTitle('📋 Whitelist').setDescription(whitelist.size?[...whitelist].map(id=>`<@${id}> \`${id}\``).join('\n'):'Empty').setColor('Blurple')], ephemeral:true});
+    if (!t) return i.reply({content:'❌ Provide a user', ephemeral:true});
+    if (mode==='add') { whitelist.add(t.id); saveData(); return i.reply({content:`✅ Added <@${t.id}>`, ephemeral:true}); }
+    if (mode==='remove') { whitelist.delete(t.id); userTokens.delete(t.id); saveData(); return i.reply({content:`❌ Removed + logged out <@${t.id}>`, ephemeral:true}); }
   }
 
-  // ==========================================
-  // 🔐 /LOGIN — WHITELISTED ONLY (UNCHANGED)
-  // ==========================================
+  // 🔐 LOGIN
   if (commandName === 'login') {
-    if (!isWhitelisted(user.id)) return i.reply({
-      content: '🚫 **NOT WHITELISTED** — Ask the owner to add you first.',
-      ephemeral: true
-    });
-
-    const token = i.options.getString('token');
-    userTokens.set(user.id, token.trim());
-    saveData();
-    return i.reply({
-      content: '🔐 **LOGGED IN SUCCESSFULLY!**\n> Your token is private — *only you can see this message.*',
-      ephemeral: true
-    });
+    if (!isWhitelisted(user.id)) return i.reply({content:'🚫 Not whitelisted', ephemeral:true});
+    userTokens.set(user.id, i.options.getString('token').trim()); saveData();
+    return i.reply({content:'🔐 Logged in (private)', ephemeral:true});
   }
 
-  // ==========================================
-  // ⚡ /FORWARD — UNLIMITED + DUPLICATE SKIP
-  // ==========================================
+  // ⚡ FORWARD — UNLIMITED + DUPE SKIP
   if (commandName === 'forward') {
-    // Permission checks
-    if (!isWhitelisted(user.id)) return i.reply({
-      content: '🚫 **NOT WHITELISTED** — Ask the owner for access.',
-      ephemer
+    if (!isWhitelisted(user.id)) return i.reply({content:'🚫 Not whitelisted', ephemeral:true});
+    if (!isLoggedIn(user.id)) return i.reply({content:'⚠️ Login first with /login', ephemeral:true});
+    const src = i.options.getChannel('source'); const dst = i.options.getChannel('destination');
+    if (!src||!dst) return i.reply({content:'❌ Invalid channels', ephemeral:true});
+    if (src.id===dst.id) return i.reply({content:'❌ Same channel', ephemeral:true});
+
+    await i.deferReply({ephemeral:true});
+    const start = Date.now();
+    try {
+      // Parallel fetch source + destination signatures (FASTER)
+      const [messages, existing] = await Promise.all([
+        fetchAllMessages(src), fetchDestSignatures(dst)
+      ]);
+
+      const counts = {txt:0,lua:0,zip:0}; const files = []; let skipped = 0;
+      for (const m of messages) {
+        if (!m.attachments.size) continue;
+        for (const a of m.attachments.values()) {
+          const ext = a.name.split('.').pop()?.toLowerCase();
+          if (!ALLOWED_EXT.includes(ext)) continue;
+          // SKIP DUPLICATE (filename + size match)
+          if (existing.has(`${a.name.toLowerCase()}|${a.size}`)) { skipped++; continue; }
+          counts[ext]++; files.push({attachment:a.url, name:a.name});
+        }
+      }
+
+      if (!files.length) return i.editReply(`📭 No new files (scanned ${messages.length} msgs | skipped ${skipped} duplicates)`);
+
+      const batches = [];
+      for (let x=0;x<files.length;x+=BATCH_SIZE) batches.push(files.slice(x,x+BATCH_SIZE));
+      await sendFast(dst, batches);
+      const sec = ((Date.now()-start)/1000).toFixed(1);
+
+      // YOUR EXACT EMBED
+      await dst.send({embeds:[new EmbedBuilder()
+        .setTitle('✅ Forward done!')
+        .setDescription(`I got this from <#${src.id}> and i forward it to <#${dst.id}> and yeah, i got **${counts.txt}** .txt, **${counts.lua}** .lua, and **${counts.zip}** .zip.`)
+        .setColor('Green')
+        .setFooter({text:'Forwarder Bot︱.gg/freesource'})
+        .setTimestamp()
+      ]});
+
+      return i.editReply(`✅ DONE ⚡\n📤 ${files.length} new files | ⏭️ Skipped ${skipped} duplicates\n⏱️ ${sec}s | 📦 ${batches.length} batches`);
+    } catch(e) {
+      return i.editReply(`❌ Error: \`${e.message}\`\nCheck bot perms (Read History in source / Send+Attach in dest)`);
+    }
+  }
+});
+
+client.login(BOT_TOKEN).catch(e => { console.error('LOGIN FAIL:',e.message); process.exit(1); });
