@@ -91,25 +91,47 @@ function startBot() {
     new SlashCommandBuilder()
       .setName('ping')
       .setDescription('🏓 Test if bot responds'),
+
     new SlashCommandBuilder()
       .setName('login')
       .setDescription('🔐 Login with your private token')
-      .addStringOption(o => o.setName('token').setDescription('Private token').setRequired(true)),
+      .addStringOption(o =>
+        o.setName('token')
+          .setDescription('Your private token')
+          .setRequired(true)
+      ),
+
     new SlashCommandBuilder()
       .setName('forward')
       .setDescription('⚡ Forward .txt/.lua/.zip + skip duplicates')
-      .addChannelOption(o => o.setName('source').setDescription('Source channel').setRequired(true))
-      .addChannelOption(o => o.setName('destination').setDescription('Destination channel').setRequired(true)),
+      .addChannelOption(o =>
+        o.setName('source')
+          .setDescription('Source channel')
+          .setRequired(true)
+      )
+      .addChannelOption(o =>
+        o.setName('destination')
+          .setDescription('Destination channel')
+          .setRequired(true)
+      ),
+
     new SlashCommandBuilder()
       .setName('whitelist')
-      .setDescription('👑 OWNER ONLY')
-      .addStringOption(o => o.setName('mode').setRequired(true)
-        .addChoices(
-          { name: 'Add', value: 'add' },
-          { name: 'Remove', value: 'remove' },
-          { name: 'List', value: 'list' }
-        ))
-      .addUserOption(o => o.setName('user').setDescription('User (ID/mention)'))
+      .setDescription('👑 OWNER ONLY – manage whitelist')
+      .addStringOption(o =>
+        o.setName('mode')
+          .setDescription('Add, Remove or List')
+          .setRequired(true)
+          .addChoices(
+            { name: 'Add', value: 'add' },
+            { name: 'Remove', value: 'remove' },
+            { name: 'List', value: 'list' }
+          )
+      )
+      .addUserOption(o =>
+        o.setName('user')
+          .setDescription('User to add or remove (not needed for List)')
+      )
   ].map(c => c.toJSON());
 
   // ==========================================
